@@ -265,7 +265,7 @@ def get_run_ids(run_meta):
         run_ids.append(run['run_id'])
     return run_ids
 
-def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=True):
+def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=True, splitFiles=False):
 
     #
     # determine the list of ids to download
@@ -299,7 +299,9 @@ def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=Tru
             tmpdir = os.getenv("TMPDIR")
             if tmpdir is None:
                 tmpdir = "/tmp"
-            fasterq_dump_cmd = [fasterq_dump_loc, '-t', tmpdir, '--outdir', output_dir,  '--split-files', '-f', run_id]
+            fasterq_dump_cmd = [fasterq_dump_loc, '-t', tmpdir, '--outdir', output_dir, '-f', run_id]
+            if splitFiles: #optional, not needed, --split-3 is the default (see https://github.com/ncbi/sra-tools/wiki/HowTo:-fasterq-dump)
+                fasterq_dump_cmd.append('--split-files')
 
         try:
             print( 'executing \'' + str(fasterq_dump_cmd) + '\'', file=sys.stderr)
@@ -379,7 +381,8 @@ def retry_subprocess_check_output(cmd, n_retries, retry_sleep):
         last_error = ret
         failed = True
 
-    print("Failed after %s retries running %s" % (attempt, cmd), file=sys.stderr)
-    raise ret
+    message = "Failed after %s retries running %s" % (attempt, cmd)
+    print(message, file=sys.stderr)
+    raise Exception(message)
 
 
