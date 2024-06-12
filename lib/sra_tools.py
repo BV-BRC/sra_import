@@ -8,13 +8,13 @@ import os
 import time
 import random
 from collections import OrderedDict
-import StringIO
+from io import StringIO
 from lxml import etree
 import sys
 import requests
 
 import shutil
-import urllib2
+import urllib
 
 def safe_read(element, xpath, index=None, xpath_fallback=None):
 
@@ -38,7 +38,7 @@ def safe_read(element, xpath, index=None, xpath_fallback=None):
 
 
 def get_accession_metadata(accession_id, sra_metadata_file):
-    print "Getting accession: {}".format(str(accession_id))
+    print("Getting accession: {}".format(str(accession_id)))
     params = { 'db': 'sra', 'rettype': 'docset', 'id': accession_id }
     # params = { 'save': 'efetch', 'db': 'sra', 'rettype': 'docset', 'term': accession_id }
     retry_count = 0
@@ -48,7 +48,7 @@ def get_accession_metadata(accession_id, sra_metadata_file):
         # ret = requests.get('https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi', params=params)
         if ret.status_code == 429:
             delay = retry_count + random.uniform(0, 2)
-            print >> sys.stderr,  "Delaying for 429 error " + str(delay)
+            print(  "Delaying for 429 error " + str(delay), file=sys.stderr)
             time.sleep(delay)
             retry_count = retry_count + 1
         elif ret.status_code != 200:
@@ -59,16 +59,18 @@ def get_accession_metadata(accession_id, sra_metadata_file):
 
     #print("GOT: ", ret, params);
     parser = etree.XMLParser(remove_blank_text=True)
-    if type(ret.text) == unicode:
-        result_obj = StringIO.StringIO(ret.text.encode('utf-8'));
-    else:
-        result_obj = StringIO.StringIO(ret.text);
-    tree = etree.parse(result_obj, parser)
+#    if type(ret.text) == unicode:
+#        result_obj = StringIO.StringIO(ret.text.encode('utf-8'));
+#    else:
+#        result_obj = StringIO.StringIO(ret.text);
+    tree = etree.fromstring(ret.text.encode('ascii'))
+
+#    tree = etree.parse(result_obj, parser)
 
     # print it out just for fun
     if sra_metadata_file:
         fp = file(sra_metadata_file, "w")
-        print >> fp, etree.tostring(tree, pretty_print=True)
+        print( etree.tostring(tree, pretty_print=True), file=fp)
         fp.close()
     
     return parse_accession_metadata(accession_id, tree)
@@ -112,17 +114,17 @@ def parse_accession_metadata(accession_id, tree):
             rdata['run_id'] = safe_read(run, '@accession')[0]
             my_out = "run: {}, exp: {}, study: {}".format(rdata['run_id'], exp['exp_id'], exp['study_id'])
             if accession_id != None and rdata['run_id'] != accession_id and accession_id != exp['exp_id'] and accession_id != exp['study_id']:
-                print >> sys.stderr, "Skipping -- " + my_out
+                print( "Skipping -- " + my_out, file=sys.stderr)
                 continue
             else:
-                print >> sys.stderr, "Using -- " + my_out
+                print( "Using -- " + my_out, file=sys.stderr)
             rdata['accession'] = rdata['run_id']
             try:
                 rdata['total_bases'] = int(safe_read(run, '@total_bases')[0])
                 rdata['total_spots'] = int(safe_read(run, '@total_spots')[0])
                 rdata['size'] = int(safe_read(run, '@size')[0])
             except Exception as e:
-                print >> sys.stderr, "Data size not found"
+                print( "Data size not found", file=sys.stderr)
             #
             # Try to pull the read length
             #
@@ -143,10 +145,11 @@ def parse_accession_metadata(accession_id, tree):
                 nreads = 0
                 for read in stats:
                     rattr = read.attrib
-                    # print >> sys.stderr, rattr
+                    # print( rattr, file=sys.stderr)
                     if rattr.has_key('count') and int(rattr['count']) > 0:
                         nreads += 1
-                    if rattr.has_key('average') and not rdata.has_key('read_length'):
+                    print(rdata)
+                    if rattr.has_key('average') and not 'read_length' in rdata:
                         rdata['read_length'] = float(rattr['average'])
                 if nreads > 0:
                     rdata['n_reads'] = nreads
@@ -162,21 +165,21 @@ def parse_accession_metadata(accession_id, tree):
             # if possible with incomplete size data.
             #
             try:
-                if not rdata.has_key('n_reads'):
+                if not 'n_reads' in rdata:
                     if exp['library_layout'] == 'PAIRED':
                         rdata['n_reads'] = 2
                     else:
                         rdata['n_reads'] = 1
 
-                if rdata.has_key('read_length'):
+                if 'read_length' in rdata:
                     calc_bases = rdata['read_length'] * rdata['n_reads'] * rdata['total_spots']
                     err = abs(calc_bases - rdata['total_bases']) / rdata['total_bases']
-                    # print >> sys.stderr, "calc=%d val=%d %f" % (calc_bases, rdata['total_bases'], err)
+                    # print( "calc=%d val=%d %f" % (calc_bases, rdata['total_bases'], err), file=sys.stderr)
                     
                     if err > 0.1:
-                        print >> sys.stderr, "Bad size calculation"
+                        print( "Bad size calculation", file=sys.stderr)
                     else:
-                        if rdata.has_key('run_id'):
+                        if 'run_id' in rdata:
                             hlen = len(rdata['run_id']) + 50
                         else:
                             hlen = 40
@@ -186,7 +189,7 @@ def parse_accession_metadata(accession_id, tree):
                         
                             
             except Exception as e:
-                print >> sys.stderr, "Failed to compute size data"
+                print(f"Failed to compute size data: {e}", file=sys.stderr)
             # print(rdata)
             exp['runs'].append(rdata)
 
@@ -232,7 +235,7 @@ def get_runinfo(run_accession):
     """
     runinfo_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=sra&rettype=runinfo&id="+run_accession
     # runinfo_url = "https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi?save=efetch&db=sra&rettype=runinfo&term="+run_accession
-    r = urllib2.urlopen(runinfo_url)
+    r = urllib.urlopen(runinfo_url)
     lines = r.read().split("\n")
     keys   = lines[0].split(",")
     values = lines[1].split(",")
@@ -245,7 +248,7 @@ def ftp_download_single_run(run_accession):
     """
     sra_file_url = "ftp://ftp-trace.ncbi.nih.gov/sra/sra-instant/reads/ByRun/sra/%s/%s/%s/%s.sra"%(run_accession[:3], run_accession[:6], run_accession, run_accession)
     with open(run_accession+".sra", 'wb') as OUT:
-        response = urllib2.urlopen(sra_file_url)
+        response = urllib.urlopen(sra_file_url)
         shutil.copyfileobj(response, OUT)
 
 def fastqDumpExistingSraFile(file_name, splitFiles = False):
@@ -278,7 +281,7 @@ def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=Tru
         result = retry_subprocess_check_output(cmd, 10, 60);
 
     except subprocess.CalledProcessError as e:
-        print >> sys.stderr,  "Prefetch failed with code " + str(e.returncode)
+        print(  "Prefetch failed with code " + str(e.returncode), file=sys.stderr)
 
     # for each run, download the fastq file
     for item in metadata:
@@ -301,11 +304,11 @@ def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=Tru
                 fasterq_dump_cmd.append('--split-files')
 
         try:
-            # print >> sys.stderr, 'executing \'' + str(fasterq_dump_cmd) + '\''
+            # print( 'executing \'' + str(fasterq_dump_cmd) + '\'', file=sys.stderr)
             result = retry_subprocess_check_output(fasterq_dump_cmd, 5, 60)
 
         except subprocess.CalledProcessError as e:
-            print >> sys.stderr,  "Download failed with code " + str(e.returncode)
+            print( "Download failed with code " + str(e.returncode), file=sys.stderr)
             sys.exit(e.returncode)
 
         # gzip the output; gzip will skip anything already zipped
@@ -327,20 +330,20 @@ def download_sra_data(fasterq_dump_loc, fastq_output_dir, accession_id, metaonly
     if not metaonly:
 
         download_fastq_files(fasterq_dump_loc, fastq_output_dir, metadata, gzip_output=compress_files)
-        # print >> sys.stderr, 'Fastq Filenames:'
-        # print >> sys.stderr, (glob.glob(fastq_output_dir+'/*.fastq*'))
+        # print( 'Fastq Filenames:', file=sys.stderr)
+        # print( (glob.glob(fastq_output_dir+'/*.fastq*')), file=sys.stderr)
         for run in metadata:
             run_id = run.get("run_id",None)
             files = glob.glob(os.path.join(fastq_output_dir,"*"+run_id+"*"))
             run['files']=[os.path.basename(f) for f in files]
 
     # ===== 3. Pack it into the output JSON
-    # print >> sys.stderr, 'Metadata:'
-    # print >> sys.stderr, json.dumps(metadata, indent=1)
+    # print( 'Metadata:', file=sys.stderr)
+    # print( json.dumps(metadata, indent=1), file=sys.stderr)
     if metadata_file:
-        fp = file(metadata_file, "w")
-        json.dump(metadata, fp, indent=2)
-        fp.close()
+        with open(metadata_file, "w") as fp:
+            json.dump(metadata, fp, indent=2)
+
 
 
     # ===== 4. Add everything to the workspace (?)
@@ -360,25 +363,25 @@ def retry_subprocess_check_output(cmd, n_retries, retry_sleep):
         # We run this with stdout/stderr to temp files so we can examine them.
         #
         
-        print >> sys.stderr, "Attempt %d of %d at running %s" % (attempt, n_retries, cmd)
+        print( "Attempt %d of %d at running %s" % (attempt, n_retries, cmd), file=sys.stderr)
         err = tempfile.TemporaryFile()
         ret =  subprocess.call(cmd, stderr=err)
-        print "ret=", ret
+        print("ret=", ret)
         if ret == 0:
             return
 
         err.seek(0)
         edata = err.read()
         if re.search("failed to resolve", edata, re.MULTILINE):
-            print >> sys.stderr, "Invalid accession"
-            print >> sys.stderr, edata
+            print("Invalid accession", file=sys.stderr)
+            print(edata, file=sys.stderr)
             raise RuntimeError("SRA resolution failure")
-        print >> sys.stderr, "Attempt %d of %d failed at running %s: %s" % (attempt, n_retries, cmd, ret)
-        print >> sys.stderr, edata
+        print ( "Attempt %d of %d failed at running %s: %s" % (attempt, n_retries, cmd, ret), file=sys.stderr)
+        print(edata, file=sys.stderr)
         last_error = ret
         failed = True
 
-    print >> sys.stderr, "Failed after %s retries running %s" % (attempt, cmd)
+    print("Failed after %s retries running %s" % (attempt, cmd), file=sys.stderr)
     raise ret
 
 
