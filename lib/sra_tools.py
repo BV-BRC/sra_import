@@ -381,7 +381,8 @@ def retry_subprocess_check_output(cmd, n_retries, retry_sleep):
         last_error = ret
         failed = True
 
-    print("Failed after %s retries running %s" % (attempt, cmd), file=sys.stderr)
-    raise ret
+    message = "Failed after %s retries running %s" % (attempt, cmd)
+    print(message, file=sys.stderr)
+    raise Exception(message)
 
 
