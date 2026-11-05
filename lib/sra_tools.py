@@ -263,6 +263,62 @@ def get_run_ids(run_meta):
         run_ids.append(run['run_id'])
     return run_ids
 
+#
+# A paired run may contain spots that have only one read (e.g. ERR12736578 has
+# 901 of 2,285,829). fasterq-dump --split-files writes those to _1 alone, so the
+# _1 and _2 files differ in length and assemblers such as Unicycler refuse them.
+# We dump with --split-3, which keeps _1/_2 in step and writes the orphans to
+# <run>.fastq, and then discard that file so callers see the same set of files
+# they always have. Several callers treat a bare <run>.fastq as the single-end
+# read file and would misuse it if it were left beside the pair.
+#
+# Above this fraction of orphan spots we refuse rather than silently keep a
+# small remnant of the run as its paired data. Override with the environment
+# variable P3_SRA_MAX_ORPHAN_FRACTION (1 disables the check).
+#
+DEFAULT_MAX_ORPHAN_FRACTION = 0.05
+
+def count_fastq_reads(path):
+    with open(path, 'rb') as fh:
+        lines = sum(1 for _ in fh)
+    return lines // 4
+
+def max_orphan_fraction():
+    val = os.getenv("P3_SRA_MAX_ORPHAN_FRACTION")
+    if val is None or val.strip() == "":
+        return DEFAULT_MAX_ORPHAN_FRACTION
+    return float(val)
+
+def discard_orphan_reads(output_dir, run_id, total_spots=None, max_fraction=None):
+    """If --split-3 produced both a pair and an orphan file for run_id, remove the
+    orphan file. Raises RuntimeError if orphans exceed max_fraction of the spots.
+    Returns the number of orphan reads discarded."""
+
+    read1 = os.path.join(output_dir, f"{run_id}_1.fastq")
+    read2 = os.path.join(output_dir, f"{run_id}_2.fastq")
+    orphans = os.path.join(output_dir, f"{run_id}.fastq")
+
+    if not (os.path.exists(read1) and os.path.exists(read2) and os.path.exists(orphans)):
+        return 0
+
+    if max_fraction is None:
+        max_fraction = max_orphan_fraction()
+
+    n_orphans = count_fastq_reads(orphans)
+    if not total_spots:
+        total_spots = count_fastq_reads(read1) + n_orphans
+    fraction = n_orphans / total_spots if total_spots else 1.0
+
+    sys.stderr.write(f"{run_id}: {n_orphans} of {total_spots} spots have no mate ({fraction:.4%})\n")
+
+    if fraction > max_fraction:
+        raise RuntimeError(f"{run_id}: {n_orphans} of {total_spots} spots ({fraction:.2%}) have no mate, "
+                           f"above the {max_fraction:.2%} limit; the paired files would hold only part of the run")
+
+    os.unlink(orphans)
+    sys.stderr.write(f"{run_id}: discarded {orphans}\n")
+    return n_orphans
+
 def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=True):
 
     #
@@ -297,7 +353,7 @@ def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=Tru
             tmpdir = os.getenv("TMPDIR")
             if tmpdir is None:
                 tmpdir = "/tmp"
-            fasterq_dump_cmd = [fasterq_dump_loc, '-t', tmpdir, '--outdir', output_dir,  '--split-files', '-f', run_id]
+            fasterq_dump_cmd = [fasterq_dump_loc, '-t', tmpdir, '--outdir', output_dir,  '--split-3', '-f', run_id]
 
         try:
             # print >> sys.stderr, 'executing \'' + str(fasterq_dump_cmd) + '\''
@@ -305,6 +361,9 @@ def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=Tru
 
         except subprocess.CalledProcessError as e:
             sys.stderr.write(f"Download failed with code {str(e.returncode)}\n")
+
+        if item['platform_name'] != 'PACBIO_SMRT':
+            discard_orphan_reads(output_dir, run_id, item.get('total_spots'))
 
         # gzip the output; gzip will skip anything already zipped
         if gzip_output:
