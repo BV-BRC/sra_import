@@ -37,42 +37,96 @@ def safe_read(element, xpath, index=None, xpath_fallback=None):
         return ''
 
 
+EFETCH_URL = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi'
+
+#
+# Attempts for one efetch request (rate limiting, server errors, network
+# failures), and for re-asking when a well-formed answer names no runs.
+#
+EFETCH_ATTEMPTS = 6
+EMPTY_ANSWER_ATTEMPTS = 3
+
+def response_snippet(content, limit=300):
+    text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    return text[:limit].replace('\n', ' ')
+
+def retry_delay(attempt, response=None):
+    if response is not None:
+        after = response.headers.get('Retry-After')
+        if after is not None:
+            try:
+                return max(float(after), 1.0)
+            except ValueError:
+                pass
+    return 2 ** attempt + random.uniform(0, 1)
+
+def fetch_accession_xml(accession_id):
+    """Return the efetch docset body for accession_id. NCBI's answer for an
+    unknown id (400 "ID list is empty") is returned like any other answer;
+    anything else that is not a 200 is retried and finally raised."""
+
+    params = { 'db': 'sra', 'rettype': 'docset', 'id': accession_id }
+    for attempt in range(1, EFETCH_ATTEMPTS + 1):
+        try:
+            ret = requests.get(EFETCH_URL, params=params, timeout=300)
+        except requests.exceptions.RequestException as e:
+            if attempt == EFETCH_ATTEMPTS:
+                raise RuntimeError(f"efetch for {accession_id} failed: {e}")
+            delay = retry_delay(attempt)
+            sys.stderr.write(f"efetch for {accession_id} failed ({e}); retrying in {delay:.1f}s\n")
+            time.sleep(delay)
+            continue
+
+        status = ret.status_code
+        if status == 200:
+            return ret.content
+        if status == 400 and 'ID list is empty' in str(ret.content):
+            return ret.content
+
+        retryable = status in (400, 429) or status >= 500
+        if not retryable or attempt == EFETCH_ATTEMPTS:
+            raise RuntimeError(f"efetch for {accession_id} returned HTTP {status}: {response_snippet(ret.content)}")
+        delay = retry_delay(attempt, ret)
+        sys.stderr.write(f"efetch for {accession_id} returned HTTP {status}; retrying in {delay:.1f}s: "
+                         f"{response_snippet(ret.content)}\n")
+        time.sleep(delay)
+
 def get_accession_metadata(accession_id, sra_metadata_file):
     print ("Getting accession: {}".format(str(accession_id)))
-    params = { 'db': 'sra', 'rettype': 'docset', 'id': accession_id }
-    # params = { 'save': 'efetch', 'db': 'sra', 'rettype': 'docset', 'term': accession_id }
-    retry_count = 0
-    while True:
-        ret = requests.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi', params=params)
-        return_code = ret.status_code
 
-        # ret = requests.get('https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi', params=params)
-        if ret.status_code == 429 or ret.status_code == 400:
-            #
-            # Check for error return in status 400
-            #
-            if 'ID list is empty' in str(ret.content):
-                break
-            delay = retry_count + random.uniform(0, 2)
-            sys.stderr.write(f'Delaying for HTML code {ret.status_code} error {str(delay)}\n{ret.content}')
-            time.sleep(delay)
-            retry_count = retry_count + 1
-        elif ret.status_code != 200:
-            return_code = ret.status_code
-            break
-        else:
-            break
+    #
+    # An answer that names no runs is re-asked a few times before we believe it:
+    # a job (23963680) once saw the run vanish from a lookup made half a second
+    # after an identical one had found it. A genuinely unknown id costs a few
+    # extra seconds.
+    #
+    for attempt in range(1, EMPTY_ANSWER_ATTEMPTS + 1):
+        content = fetch_accession_xml(accession_id)
+        try:
+            tree = etree.XML(content)
+            metadata = parse_accession_metadata(accession_id, tree)
+            problem = None if metadata else "names no runs"
+        except etree.XMLSyntaxError as e:
+            tree = None
+            metadata = []
+            problem = f"is not valid XML ({e})"
 
-    # print("GOT: ", return_code, ret.text, params);
-    parser = etree.XMLParser(remove_blank_text=True)
-    tree = etree.XML(ret.content);
+        if not problem:
+            break
+        sys.stderr.write(f"efetch answer for {accession_id} {problem} ({len(content)} bytes): "
+                         f"{response_snippet(content)}\n")
+        if attempt < EMPTY_ANSWER_ATTEMPTS:
+            time.sleep(retry_delay(attempt))
+
+    if tree is None:
+        raise RuntimeError(f"efetch for {accession_id} returned unparseable XML: {response_snippet(content)}")
 
     # print it out just for fun
     if sra_metadata_file:
         with open(sra_metadata_file,'wb') as fp:
             fp.write(etree.tostring(tree, pretty_print=True))
-    
-    return parse_accession_metadata(accession_id, tree)
+
+    return metadata
 
 def parse_sra_xml(xml_fh):
 
@@ -368,7 +422,7 @@ def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=Tru
         # gzip the output; gzip will skip anything already zipped
         if gzip_output:
             fq_files = glob.glob(output_dir + "/*.fastq")
-            if fq_files.count > 0:
+            if fq_files:
                 gzip_cmd = ["gzip"] + fq_files;
                 # print "gzip: " + str(gzip_cmd)
                 subprocess.call(gzip_cmd)
@@ -382,6 +436,9 @@ def download_sra_data(fasterq_dump_loc, fastq_output_dir, accession_id, metaonly
 
     # ===== 2. Get the fastq files for each run
     if not metaonly:
+
+        if not metadata:
+            raise RuntimeError(f"No SRA run metadata found for {accession_id}; nothing to download")
 
         download_fastq_files(fasterq_dump_loc, fastq_output_dir, metadata, gzip_output=compress_files)
         # print >> sys.stderr, 'Fastq Filenames:'
@@ -434,6 +491,6 @@ def retry_subprocess_check_output(cmd, n_retries, retry_sleep):
         failed = True
 
     sys.stderr.write("Failed after {} retries running {}\n".format(attempt, cmd))
-    raise ret
+    raise RuntimeError(f"{cmd} failed {attempt} times; last exit code {last_error}")
 
 
