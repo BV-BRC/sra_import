@@ -37,42 +37,96 @@ def safe_read(element, xpath, index=None, xpath_fallback=None):
         return ''
 
 
+EFETCH_URL = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi'
+
+#
+# Attempts for one efetch request (rate limiting, server errors, network
+# failures), and for re-asking when a well-formed answer names no runs.
+#
+EFETCH_ATTEMPTS = 6
+EMPTY_ANSWER_ATTEMPTS = 3
+
+def response_snippet(content, limit=300):
+    text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    return text[:limit].replace('\n', ' ')
+
+def retry_delay(attempt, response=None):
+    if response is not None:
+        after = response.headers.get('Retry-After')
+        if after is not None:
+            try:
+                return max(float(after), 1.0)
+            except ValueError:
+                pass
+    return 2 ** attempt + random.uniform(0, 1)
+
+def fetch_accession_xml(accession_id):
+    """Return the efetch docset body for accession_id. NCBI's answer for an
+    unknown id (400 "ID list is empty") is returned like any other answer;
+    anything else that is not a 200 is retried and finally raised."""
+
+    params = { 'db': 'sra', 'rettype': 'docset', 'id': accession_id }
+    for attempt in range(1, EFETCH_ATTEMPTS + 1):
+        try:
+            ret = requests.get(EFETCH_URL, params=params, timeout=300)
+        except requests.exceptions.RequestException as e:
+            if attempt == EFETCH_ATTEMPTS:
+                raise RuntimeError(f"efetch for {accession_id} failed: {e}")
+            delay = retry_delay(attempt)
+            sys.stderr.write(f"efetch for {accession_id} failed ({e}); retrying in {delay:.1f}s\n")
+            time.sleep(delay)
+            continue
+
+        status = ret.status_code
+        if status == 200:
+            return ret.content
+        if status == 400 and 'ID list is empty' in str(ret.content):
+            return ret.content
+
+        retryable = status in (400, 429) or status >= 500
+        if not retryable or attempt == EFETCH_ATTEMPTS:
+            raise RuntimeError(f"efetch for {accession_id} returned HTTP {status}: {response_snippet(ret.content)}")
+        delay = retry_delay(attempt, ret)
+        sys.stderr.write(f"efetch for {accession_id} returned HTTP {status}; retrying in {delay:.1f}s: "
+                         f"{response_snippet(ret.content)}\n")
+        time.sleep(delay)
+
 def get_accession_metadata(accession_id, sra_metadata_file):
     print ("Getting accession: {}".format(str(accession_id)))
-    params = { 'db': 'sra', 'rettype': 'docset', 'id': accession_id }
-    # params = { 'save': 'efetch', 'db': 'sra', 'rettype': 'docset', 'term': accession_id }
-    retry_count = 0
-    while True:
-        ret = requests.get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi', params=params)
-        return_code = ret.status_code
 
-        # ret = requests.get('https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi', params=params)
-        if ret.status_code == 429 or ret.status_code == 400:
-            #
-            # Check for error return in status 400
-            #
-            if 'ID list is empty' in str(ret.content):
-                break
-            delay = retry_count + random.uniform(0, 2)
-            sys.stderr.write(f'Delaying for HTML code {ret.status_code} error {str(delay)}\n{ret.content}')
-            time.sleep(delay)
-            retry_count = retry_count + 1
-        elif ret.status_code != 200:
-            return_code = ret.status_code
-            break
-        else:
-            break
+    #
+    # An answer that names no runs is re-asked a few times before we believe it:
+    # a job (23963680) once saw the run vanish from a lookup made half a second
+    # after an identical one had found it. A genuinely unknown id costs a few
+    # extra seconds.
+    #
+    for attempt in range(1, EMPTY_ANSWER_ATTEMPTS + 1):
+        content = fetch_accession_xml(accession_id)
+        try:
+            tree = etree.XML(content)
+            metadata = parse_accession_metadata(accession_id, tree)
+            problem = None if metadata else "names no runs"
+        except etree.XMLSyntaxError as e:
+            tree = None
+            metadata = []
+            problem = f"is not valid XML ({e})"
 
-    # print("GOT: ", return_code, ret.text, params);
-    parser = etree.XMLParser(remove_blank_text=True)
-    tree = etree.XML(ret.content);
+        if not problem:
+            break
+        sys.stderr.write(f"efetch answer for {accession_id} {problem} ({len(content)} bytes): "
+                         f"{response_snippet(content)}\n")
+        if attempt < EMPTY_ANSWER_ATTEMPTS:
+            time.sleep(retry_delay(attempt))
+
+    if tree is None:
+        raise RuntimeError(f"efetch for {accession_id} returned unparseable XML: {response_snippet(content)}")
 
     # print it out just for fun
     if sra_metadata_file:
         with open(sra_metadata_file,'wb') as fp:
             fp.write(etree.tostring(tree, pretty_print=True))
-    
-    return parse_accession_metadata(accession_id, tree)
+
+    return metadata
 
 def parse_sra_xml(xml_fh):
 
@@ -263,6 +317,62 @@ def get_run_ids(run_meta):
         run_ids.append(run['run_id'])
     return run_ids
 
+#
+# A paired run may contain spots that have only one read (e.g. ERR12736578 has
+# 901 of 2,285,829). fasterq-dump --split-files writes those to _1 alone, so the
+# _1 and _2 files differ in length and assemblers such as Unicycler refuse them.
+# We dump with --split-3, which keeps _1/_2 in step and writes the orphans to
+# <run>.fastq, and then discard that file so callers see the same set of files
+# they always have. Several callers treat a bare <run>.fastq as the single-end
+# read file and would misuse it if it were left beside the pair.
+#
+# Above this fraction of orphan spots we refuse rather than silently keep a
+# small remnant of the run as its paired data. Override with the environment
+# variable P3_SRA_MAX_ORPHAN_FRACTION (1 disables the check).
+#
+DEFAULT_MAX_ORPHAN_FRACTION = 0.05
+
+def count_fastq_reads(path):
+    with open(path, 'rb') as fh:
+        lines = sum(1 for _ in fh)
+    return lines // 4
+
+def max_orphan_fraction():
+    val = os.getenv("P3_SRA_MAX_ORPHAN_FRACTION")
+    if val is None or val.strip() == "":
+        return DEFAULT_MAX_ORPHAN_FRACTION
+    return float(val)
+
+def discard_orphan_reads(output_dir, run_id, total_spots=None, max_fraction=None):
+    """If --split-3 produced both a pair and an orphan file for run_id, remove the
+    orphan file. Raises RuntimeError if orphans exceed max_fraction of the spots.
+    Returns the number of orphan reads discarded."""
+
+    read1 = os.path.join(output_dir, f"{run_id}_1.fastq")
+    read2 = os.path.join(output_dir, f"{run_id}_2.fastq")
+    orphans = os.path.join(output_dir, f"{run_id}.fastq")
+
+    if not (os.path.exists(read1) and os.path.exists(read2) and os.path.exists(orphans)):
+        return 0
+
+    if max_fraction is None:
+        max_fraction = max_orphan_fraction()
+
+    n_orphans = count_fastq_reads(orphans)
+    if not total_spots:
+        total_spots = count_fastq_reads(read1) + n_orphans
+    fraction = n_orphans / total_spots if total_spots else 1.0
+
+    sys.stderr.write(f"{run_id}: {n_orphans} of {total_spots} spots have no mate ({fraction:.4%})\n")
+
+    if fraction > max_fraction:
+        raise RuntimeError(f"{run_id}: {n_orphans} of {total_spots} spots ({fraction:.2%}) have no mate, "
+                           f"above the {max_fraction:.2%} limit; the paired files would hold only part of the run")
+
+    os.unlink(orphans)
+    sys.stderr.write(f"{run_id}: discarded {orphans}\n")
+    return n_orphans
+
 def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=True):
 
     #
@@ -297,7 +407,7 @@ def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=Tru
             tmpdir = os.getenv("TMPDIR")
             if tmpdir is None:
                 tmpdir = "/tmp"
-            fasterq_dump_cmd = [fasterq_dump_loc, '-t', tmpdir, '--outdir', output_dir,  '--split-files', '-f', run_id]
+            fasterq_dump_cmd = [fasterq_dump_loc, '-t', tmpdir, '--outdir', output_dir,  '--split-3', '-f', run_id]
 
         try:
             # print >> sys.stderr, 'executing \'' + str(fasterq_dump_cmd) + '\''
@@ -306,10 +416,13 @@ def download_fastq_files(fasterq_dump_loc, output_dir, metadata, gzip_output=Tru
         except subprocess.CalledProcessError as e:
             sys.stderr.write(f"Download failed with code {str(e.returncode)}\n")
 
+        if item['platform_name'] != 'PACBIO_SMRT':
+            discard_orphan_reads(output_dir, run_id, item.get('total_spots'))
+
         # gzip the output; gzip will skip anything already zipped
         if gzip_output:
             fq_files = glob.glob(output_dir + "/*.fastq")
-            if fq_files.count > 0:
+            if fq_files:
                 gzip_cmd = ["gzip"] + fq_files;
                 # print "gzip: " + str(gzip_cmd)
                 subprocess.call(gzip_cmd)
@@ -323,6 +436,9 @@ def download_sra_data(fasterq_dump_loc, fastq_output_dir, accession_id, metaonly
 
     # ===== 2. Get the fastq files for each run
     if not metaonly:
+
+        if not metadata:
+            raise RuntimeError(f"No SRA run metadata found for {accession_id}; nothing to download")
 
         download_fastq_files(fasterq_dump_loc, fastq_output_dir, metadata, gzip_output=compress_files)
         # print >> sys.stderr, 'Fastq Filenames:'
@@ -375,6 +491,6 @@ def retry_subprocess_check_output(cmd, n_retries, retry_sleep):
         failed = True
 
     sys.stderr.write("Failed after {} retries running {}\n".format(attempt, cmd))
-    raise ret
+    raise RuntimeError(f"{cmd} failed {attempt} times; last exit code {last_error}")
 
 
